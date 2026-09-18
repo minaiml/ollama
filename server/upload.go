@@ -7,24 +7,28 @@ import (
 	"fmt"
 	"hash"
 	"io"
-	"log"
+	"log/slog"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
-	"strings"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/jmorganca/ollama/api"
-	"github.com/jmorganca/ollama/format"
 	"golang.org/x/sync/errgroup"
+
+	"github.com/ollama/ollama/api"
+	"github.com/ollama/ollama/format"
+	"github.com/ollama/ollama/manifest"
+	"github.com/ollama/ollama/types/model"
 )
 
 var blobUploadManager sync.Map
 
 type blobUpload struct {
-	*Layer
+	manifest.Layer
 
 	Total     int64
 	Completed atomic.Int64
@@ -35,27 +39,21 @@ type blobUpload struct {
 
 	context.CancelFunc
 
+	file *os.File
+
 	done       bool
 	err        error
 	references atomic.Int32
 }
 
-type blobUploadPart struct {
-	// N is the part number
-	N      int
-	Offset int64
-	Size   int64
-	hash.Hash
-}
-
 const (
-	numUploadParts          = 64
-	minUploadPartSize int64 = 95 * 1000 * 1000
-	maxUploadPartSize int64 = 1000 * 1000 * 1000
+	numUploadParts          = 16
+	minUploadPartSize int64 = 100 * format.MegaByte
+	maxUploadPartSize int64 = 1000 * format.MegaByte
 )
 
-func (b *blobUpload) Prepare(ctx context.Context, requestURL *url.URL, opts *RegistryOptions) error {
-	p, err := GetBlobsPath(b.Digest)
+func (b *blobUpload) Prepare(ctx context.Context, requestURL *url.URL, opts *registryOptions) error {
+	p, err := manifest.BlobsPath(b.Digest)
 	if err != nil {
 		return err
 	}
@@ -63,7 +61,7 @@ func (b *blobUpload) Prepare(ctx context.Context, requestURL *url.URL, opts *Reg
 	if b.From != "" {
 		values := requestURL.Query()
 		values.Add("mount", b.Digest)
-		values.Add("from", b.From)
+		values.Add("from", model.ParseName(b.From).DisplayNamespaceModel())
 		requestURL.RawQuery = values.Encode()
 	}
 
@@ -85,7 +83,15 @@ func (b *blobUpload) Prepare(ctx context.Context, requestURL *url.URL, opts *Reg
 
 	b.Total = fi.Size()
 
-	var size = b.Total / numUploadParts
+	// http.StatusCreated indicates a blob has been mounted
+	// ref: https://distribution.github.io/distribution/spec/api/#cross-repository-blob-mount
+	if resp.StatusCode == http.StatusCreated {
+		b.Completed.Store(b.Total)
+		b.done = true
+		return nil
+	}
+
+	size := b.Total / numUploadParts
 	switch {
 	case size < minUploadPartSize:
 		size = minUploadPartSize
@@ -100,11 +106,13 @@ func (b *blobUpload) Prepare(ctx context.Context, requestURL *url.URL, opts *Reg
 		}
 
 		// set part.N to the current number of parts
-		b.Parts = append(b.Parts, blobUploadPart{N: len(b.Parts), Offset: offset, Size: size, Hash: md5.New()})
+		b.Parts = append(b.Parts, blobUploadPart{N: len(b.Parts), Offset: offset, Size: size})
 		offset += size
 	}
 
-	log.Printf("uploading %s in %d %s part(s)", b.Digest[7:19], len(b.Parts), format.HumanBytes(b.Parts[0].Size))
+	if len(b.Parts) > 0 {
+		slog.Info(fmt.Sprintf("uploading %s in %d %s part(s)", b.Digest[7:19], len(b.Parts), format.HumanBytes(b.Parts[0].Size)))
+	}
 
 	requestURL, err = url.Parse(location)
 	if err != nil {
@@ -118,22 +126,22 @@ func (b *blobUpload) Prepare(ctx context.Context, requestURL *url.URL, opts *Reg
 
 // Run uploads blob parts to the upstream. If the upstream supports redirection, parts will be uploaded
 // in parallel as defined by Prepare. Otherwise, parts will be uploaded serially. Run sets b.err on error.
-func (b *blobUpload) Run(ctx context.Context, opts *RegistryOptions) {
+func (b *blobUpload) Run(ctx context.Context, opts *registryOptions) {
 	defer blobUploadManager.Delete(b.Digest)
 	ctx, b.CancelFunc = context.WithCancel(ctx)
 
-	p, err := GetBlobsPath(b.Digest)
+	p, err := manifest.BlobsPath(b.Digest)
 	if err != nil {
 		b.err = err
 		return
 	}
 
-	f, err := os.Open(p)
+	b.file, err = os.Open(p)
 	if err != nil {
 		b.err = err
 		return
 	}
-	defer f.Close()
+	defer b.file.Close()
 
 	g, inner := errgroup.WithContext(ctx)
 	g.SetLimit(numUploadParts)
@@ -143,23 +151,25 @@ func (b *blobUpload) Run(ctx context.Context, opts *RegistryOptions) {
 		case <-inner.Done():
 		case requestURL := <-b.nextURL:
 			g.Go(func() error {
-				for try := 0; try < maxRetries; try++ {
-					r := io.NewSectionReader(f, part.Offset, part.Size)
-					err := b.uploadChunk(inner, http.MethodPatch, requestURL, r, part, opts)
+				var err error
+				for try := range maxRetries {
+					err = b.uploadPart(inner, http.MethodPatch, requestURL, part, opts)
 					switch {
 					case errors.Is(err, context.Canceled):
 						return err
 					case errors.Is(err, errMaxRetriesExceeded):
 						return err
 					case err != nil:
-						log.Printf("%s part %d attempt %d failed: %v, retrying", b.Digest[7:19], part.N, try, err)
+						sleep := time.Second * time.Duration(math.Pow(2, float64(try)))
+						slog.Info(fmt.Sprintf("%s part %d attempt %d failed: %v, retrying in %s", b.Digest[7:19], part.N, try, err, sleep))
+						time.Sleep(sleep)
 						continue
 					}
 
 					return nil
 				}
 
-				return errMaxRetriesExceeded
+				return fmt.Errorf("%w: %w", errMaxRetriesExceeded, err)
 			})
 		}
 	}
@@ -171,45 +181,58 @@ func (b *blobUpload) Run(ctx context.Context, opts *RegistryOptions) {
 
 	requestURL := <-b.nextURL
 
-	var sb strings.Builder
+	// calculate md5 checksum and add it to the commit request
+	md5sum := md5.New()
 	for _, part := range b.Parts {
-		sb.Write(part.Sum(nil))
+		md5sum.Write(part.Sum(nil))
 	}
-
-	md5sum := md5.Sum([]byte(sb.String()))
 
 	values := requestURL.Query()
 	values.Add("digest", b.Digest)
-	values.Add("etag", fmt.Sprintf("%x-%d", md5sum, len(b.Parts)))
+	values.Add("etag", fmt.Sprintf("%x-%d", md5sum.Sum(nil), len(b.Parts)))
 	requestURL.RawQuery = values.Encode()
 
 	headers := make(http.Header)
 	headers.Set("Content-Type", "application/octet-stream")
 	headers.Set("Content-Length", "0")
 
-	resp, err := makeRequestWithRetry(ctx, http.MethodPut, requestURL, headers, nil, opts)
-	if err != nil {
-		b.err = err
-		return
+	for try := range maxRetries {
+		var resp *http.Response
+		resp, err = makeRequestWithRetry(ctx, http.MethodPut, requestURL, headers, nil, opts)
+		if errors.Is(err, context.Canceled) {
+			break
+		} else if err != nil {
+			sleep := time.Second * time.Duration(math.Pow(2, float64(try)))
+			slog.Info(fmt.Sprintf("%s complete upload attempt %d failed: %v, retrying in %s", b.Digest[7:19], try, err, sleep))
+			time.Sleep(sleep)
+			continue
+		}
+		defer resp.Body.Close()
+		break
 	}
-	defer resp.Body.Close()
 
+	b.err = err
 	b.done = true
 }
 
-func (b *blobUpload) uploadChunk(ctx context.Context, method string, requestURL *url.URL, rs io.ReadSeeker, part *blobUploadPart, opts *RegistryOptions) error {
+func (b *blobUpload) uploadPart(ctx context.Context, method string, requestURL *url.URL, part *blobUploadPart, opts *registryOptions) error {
 	headers := make(http.Header)
 	headers.Set("Content-Type", "application/octet-stream")
-	headers.Set("Content-Length", fmt.Sprintf("%d", part.Size))
-	headers.Set("X-Redirect-Uploads", "1")
+	headers.Set("Content-Length", strconv.FormatInt(part.Size, 10))
 
 	if method == http.MethodPatch {
+		headers.Set("X-Redirect-Uploads", "1")
 		headers.Set("Content-Range", fmt.Sprintf("%d-%d", part.Offset, part.Offset+part.Size-1))
 	}
 
-	buw := blobUploadWriter{blobUpload: b}
-	resp, err := makeRequest(ctx, method, requestURL, headers, io.TeeReader(rs, io.MultiWriter(&buw, part.Hash)), opts)
+	sr := io.NewSectionReader(b.file, part.Offset, part.Size)
+
+	md5sum := md5.New()
+	w := &progressWriter{blobUpload: b}
+
+	resp, err := makeRequest(ctx, method, requestURL, headers, io.TeeReader(sr, io.MultiWriter(w, md5sum)), opts)
 	if err != nil {
+		w.Rollback()
 		return err
 	}
 	defer resp.Body.Close()
@@ -221,11 +244,13 @@ func (b *blobUpload) uploadChunk(ctx context.Context, method string, requestURL 
 
 	nextURL, err := url.Parse(location)
 	if err != nil {
+		w.Rollback()
 		return err
 	}
 
 	switch {
 	case resp.StatusCode == http.StatusTemporaryRedirect:
+		w.Rollback()
 		b.nextURL <- nextURL
 
 		redirectURL, err := resp.Location()
@@ -233,31 +258,30 @@ func (b *blobUpload) uploadChunk(ctx context.Context, method string, requestURL 
 			return err
 		}
 
-		for try := 0; try < maxRetries; try++ {
-			rs.Seek(0, io.SeekStart)
-			b.Completed.Add(-buw.written)
-			buw.written = 0
-			part.Hash = md5.New()
-			err := b.uploadChunk(ctx, http.MethodPut, redirectURL, rs, part, nil)
+		// retry uploading to the redirect URL
+		for try := range maxRetries {
+			err = b.uploadPart(ctx, http.MethodPut, redirectURL, part, &registryOptions{})
 			switch {
 			case errors.Is(err, context.Canceled):
 				return err
 			case errors.Is(err, errMaxRetriesExceeded):
 				return err
 			case err != nil:
-				log.Printf("%s part %d attempt %d failed: %v, retrying", b.Digest[7:19], part.N, try, err)
+				sleep := time.Second * time.Duration(math.Pow(2, float64(try)))
+				slog.Info(fmt.Sprintf("%s part %d attempt %d failed: %v, retrying in %s", b.Digest[7:19], part.N, try, err, sleep))
+				time.Sleep(sleep)
 				continue
 			}
 
 			return nil
 		}
 
-		return errMaxRetriesExceeded
+		return fmt.Errorf("%w: %w", errMaxRetriesExceeded, err)
 
 	case resp.StatusCode == http.StatusUnauthorized:
-		auth := resp.Header.Get("www-authenticate")
-		authRedir := ParseAuthRedirectString(auth)
-		token, err := getAuthToken(ctx, authRedir)
+		w.Rollback()
+		challenge := parseRegistryChallenge(resp.Header.Get("www-authenticate"))
+		token, err := getAuthorizationToken(ctx, challenge, requestURL.Host)
 		if err != nil {
 			return err
 		}
@@ -265,21 +289,20 @@ func (b *blobUpload) uploadChunk(ctx context.Context, method string, requestURL 
 		opts.Token = token
 		fallthrough
 	case resp.StatusCode >= http.StatusBadRequest:
+		w.Rollback()
 		body, err := io.ReadAll(resp.Body)
 		if err != nil {
 			return err
 		}
 
-		rs.Seek(0, io.SeekStart)
-		b.Completed.Add(-buw.written)
-		buw.written = 0
-		return fmt.Errorf("http status %d %s: %s", resp.StatusCode, resp.Status, body)
+		return fmt.Errorf("http status %s: %s", resp.Status, body)
 	}
 
 	if method == http.MethodPatch {
 		b.nextURL <- nextURL
 	}
 
+	part.Hash = md5sum
 	return nil
 }
 
@@ -306,7 +329,7 @@ func (b *blobUpload) Wait(ctx context.Context, fn func(api.ProgressResponse)) er
 		}
 
 		fn(api.ProgressResponse{
-			Status:    fmt.Sprintf("uploading %s", b.Digest),
+			Status:    fmt.Sprintf("pushing %s", b.Digest[7:19]),
 			Digest:    b.Digest,
 			Total:     b.Total,
 			Completed: b.Completed.Load(),
@@ -318,21 +341,34 @@ func (b *blobUpload) Wait(ctx context.Context, fn func(api.ProgressResponse)) er
 	}
 }
 
-type blobUploadWriter struct {
+type blobUploadPart struct {
+	// N is the part number
+	N      int
+	Offset int64
+	Size   int64
+	hash.Hash
+}
+
+type progressWriter struct {
 	written int64
 	*blobUpload
 }
 
-func (b *blobUploadWriter) Write(p []byte) (n int, err error) {
-	n = len(p)
-	b.written += int64(n)
-	b.Completed.Add(int64(n))
+func (p *progressWriter) Write(b []byte) (n int, err error) {
+	n = len(b)
+	p.written += int64(n)
+	p.Completed.Add(int64(n))
 	return n, nil
 }
 
-func uploadBlob(ctx context.Context, mp ModelPath, layer *Layer, opts *RegistryOptions, fn func(api.ProgressResponse)) error {
-	requestURL := mp.BaseURL()
-	requestURL = requestURL.JoinPath("v2", mp.GetNamespaceRepository(), "blobs", layer.Digest)
+func (p *progressWriter) Rollback() {
+	p.Completed.Add(-p.written)
+	p.written = 0
+}
+
+func uploadBlob(ctx context.Context, n model.Name, layer manifest.Layer, opts *registryOptions, fn func(api.ProgressResponse)) error {
+	requestURL := n.BaseURL()
+	requestURL = requestURL.JoinPath("v2", n.DisplayNamespaceModel(), "blobs", layer.Digest)
 
 	resp, err := makeRequestWithRetry(ctx, http.MethodHead, requestURL, nil, nil, opts)
 	switch {
@@ -342,7 +378,7 @@ func uploadBlob(ctx context.Context, mp ModelPath, layer *Layer, opts *RegistryO
 	default:
 		defer resp.Body.Close()
 		fn(api.ProgressResponse{
-			Status:    fmt.Sprintf("uploading %s", layer.Digest),
+			Status:    fmt.Sprintf("pushing %s", layer.Digest[7:19]),
 			Digest:    layer.Digest,
 			Total:     layer.Size,
 			Completed: layer.Size,
@@ -354,13 +390,14 @@ func uploadBlob(ctx context.Context, mp ModelPath, layer *Layer, opts *RegistryO
 	data, ok := blobUploadManager.LoadOrStore(layer.Digest, &blobUpload{Layer: layer})
 	upload := data.(*blobUpload)
 	if !ok {
-		requestURL := mp.BaseURL()
-		requestURL = requestURL.JoinPath("v2", mp.GetNamespaceRepository(), "blobs/uploads/")
+		requestURL := n.BaseURL()
+		requestURL = requestURL.JoinPath("v2", n.DisplayNamespaceModel(), "blobs/uploads/")
 		if err := upload.Prepare(ctx, requestURL, opts); err != nil {
 			blobUploadManager.Delete(layer.Digest)
 			return err
 		}
 
+		//nolint:contextcheck
 		go upload.Run(context.Background(), opts)
 	}
 
